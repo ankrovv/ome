@@ -342,6 +342,7 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 
 	if w.isToDownloadOverrideDueToDownloadPolicyBasedOnBM(oldBaseModel, newBaseModel) {
 		w.generateDownloadOverrideTaskBasedOnBaseModel(newBaseModel)
+		return
 	}
 
 	hasChanges := false
@@ -362,7 +363,7 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 		hasChanges = hasChanges || (result != "")
 	}
 
-	if hasChanges && w.shouldDownloadModelInUpdateEvent(newBaseModel.Spec.Storage) {
+	if hasChanges && w.shouldDownloadModelInUpdateEvent(oldBaseModel.Spec.Storage, newBaseModel.Spec.Storage) {
 		w.logger.Infof("BaseModel %s needs refresh in namespace %s", newBaseModel.GetName(), newBaseModel.GetNamespace())
 		w.generateDownloadOverrideTaskBasedOnBaseModel(newBaseModel)
 	}
@@ -397,6 +398,7 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 
 	if w.isToDownloadOverrideDueToDownloadPolicyBasedOnCBM(oldClusterBaseModel, newClusterBaseModel) {
 		w.generateDownloadOverrideTaskBasedOnClusterBaseModel(newClusterBaseModel)
+		return
 	}
 
 	hasChanges := false
@@ -417,7 +419,7 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 		hasChanges = hasChanges || (result != "")
 	}
 
-	if hasChanges && w.shouldDownloadModelInUpdateEvent(newClusterBaseModel.Spec.Storage) {
+	if hasChanges && w.shouldDownloadModelInUpdateEvent(oldClusterBaseModel.Spec.Storage, newClusterBaseModel.Spec.Storage) {
 		w.logger.Infof("ClusterBaseModel %s need refresh", newClusterBaseModel.GetName())
 		w.generateDownloadOverrideTaskBasedOnClusterBaseModel(newClusterBaseModel)
 	}
@@ -547,10 +549,22 @@ func (w *Scout) shouldDownloadModel(storageSpec *v1beta1.StorageSpec) bool {
 	return w.shouldDownloadModelCommon(storageSpec, true)
 }
 
-// shouldDownloadModelInUpdateEvent mirrors shouldDownloadModel logic but uses a default false decision,
-// allowing callers to opt-in specific cases for updates if needed.
-func (w *Scout) shouldDownloadModelInUpdateEvent(storageSpec *v1beta1.StorageSpec) bool {
-	return w.shouldDownloadModelCommon(storageSpec, false)
+// shouldDownloadModelInUpdateEvent mirrors shouldDownloadModel logic but uses a default false decision.
+// Storage identity changes are explicit refresh triggers when the updated model still targets this node.
+func (w *Scout) shouldDownloadModelInUpdateEvent(oldStorageSpec, newStorageSpec *v1beta1.StorageSpec) bool {
+	if storageIdentityChanged(oldStorageSpec, newStorageSpec) {
+		return w.shouldDownloadModel(newStorageSpec)
+	}
+	return w.shouldDownloadModelCommon(newStorageSpec, false)
+}
+
+func storageIdentityChanged(oldStorageSpec, newStorageSpec *v1beta1.StorageSpec) bool {
+	oldURI, oldPath, oldOK := StorageIdentityForStorageSpec(oldStorageSpec)
+	newURI, newPath, newOK := StorageIdentityForStorageSpec(newStorageSpec)
+	if oldOK != newOK {
+		return true
+	}
+	return oldURI != newURI || oldPath != newPath
 }
 
 func (w *Scout) nodeMatchesSelectorTerm(term v1.NodeSelectorTerm) bool {

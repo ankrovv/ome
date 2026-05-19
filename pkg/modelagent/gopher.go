@@ -2,6 +2,7 @@ package modelagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,6 +44,11 @@ type GopherTask struct {
 	TensorRTLLMShapeFilter *TensorRTLLMShapeFilter
 }
 
+type activeDownload struct {
+	cancel     context.CancelFunc
+	generation uint64
+}
+
 type Gopher struct {
 	modelConfigParser      *ModelConfigParser
 	configMapReconciler    *ConfigMapReconciler
@@ -61,8 +67,9 @@ type Gopher struct {
 	clusterBaseModelLister omev1beta1lister.ClusterBaseModelLister
 
 	// Track active downloads for cancellation
-	activeDownloads      map[string]context.CancelFunc // key: model UID
-	activeDownloadsMutex sync.RWMutex
+	activeDownloads          map[string]activeDownload // key: model UID
+	activeDownloadGeneration uint64
+	activeDownloadsMutex     sync.RWMutex
 }
 
 const (
@@ -102,7 +109,7 @@ func NewGopher(
 		nodeLabelReconciler:    nodeLabelReconciler,
 		metrics:                metrics,
 		logger:                 logger,
-		activeDownloads:        make(map[string]context.CancelFunc),
+		activeDownloads:        make(map[string]activeDownload),
 		baseModelLister:        baseModelLister,
 		clusterBaseModelLister: clusterBaseModelLister,
 	}, nil
@@ -237,6 +244,57 @@ func (s *Gopher) safeParseAndUpdateModelConfig(modelPath string, baseModel *v1be
 	return nil
 }
 
+func (s *Gopher) registerActiveDownload(modelUID, modelInfo string, cancel context.CancelFunc) uint64 {
+	s.activeDownloadsMutex.Lock()
+	defer s.activeDownloadsMutex.Unlock()
+
+	s.activeDownloadGeneration++
+	generation := s.activeDownloadGeneration
+	if active, exists := s.activeDownloads[modelUID]; exists {
+		s.logger.Infof("Cancelling superseded download for model %s", modelInfo)
+		active.cancel()
+	}
+	s.activeDownloads[modelUID] = activeDownload{
+		cancel:     cancel,
+		generation: generation,
+	}
+	return generation
+}
+
+func (s *Gopher) unregisterActiveDownload(modelUID string, generation uint64) {
+	s.activeDownloadsMutex.Lock()
+	defer s.activeDownloadsMutex.Unlock()
+
+	if active, exists := s.activeDownloads[modelUID]; exists && active.generation == generation {
+		delete(s.activeDownloads, modelUID)
+	}
+}
+
+func (s *Gopher) cancelActiveDownload(modelUID, modelInfo string) (uint64, bool) {
+	s.activeDownloadsMutex.RLock()
+	active, exists := s.activeDownloads[modelUID]
+	s.activeDownloadsMutex.RUnlock()
+	if !exists {
+		return 0, false
+	}
+
+	s.logger.Infof("Cancelling ongoing download for model %s", modelInfo)
+	active.cancel()
+	return active.generation, true
+}
+
+func (s *Gopher) isActiveDownloadCurrent(modelUID string, generation uint64) bool {
+	s.activeDownloadsMutex.RLock()
+	defer s.activeDownloadsMutex.RUnlock()
+
+	active, exists := s.activeDownloads[modelUID]
+	return exists && active.generation == generation
+}
+
+func isDownloadCanceled(ctx context.Context, err error) bool {
+	return err != nil && (errors.Is(err, context.Canceled) || (ctx != nil && ctx.Err() != nil))
+}
+
 func (s *Gopher) processTask(task *GopherTask) error {
 	if task.BaseModel == nil && task.ClusterBaseModel == nil {
 		return fmt.Errorf("gopher got empty task")
@@ -260,9 +318,16 @@ func (s *Gopher) processTask(task *GopherTask) error {
 	// Create context - will be cancellable for downloads
 	ctx := context.Background()
 	var cancel context.CancelFunc
+	var activeDownloadGeneration uint64
 
 	// For Download and DownloadOverride tasks, set the node label to "Updating"
 	if task.TaskType == Download || task.TaskType == DownloadOverride {
+		// Create a cancellable context for this download
+		ctx, cancel = context.WithCancel(context.Background())
+
+		// Register before publishing Updating so any older same-model download is superseded first.
+		activeDownloadGeneration = s.registerActiveDownload(modelUID, modelInfo, cancel)
+
 		s.logger.Infof("Setting model %s status to Updating before download", modelInfo)
 		nodeLabelOp := &NodeLabelOp{
 			ModelStateOnNode: Updating,
@@ -275,19 +340,9 @@ func (s *Gopher) processTask(task *GopherTask) error {
 			// Continue with download anyway
 		}
 
-		// Create a cancellable context for this download
-		ctx, cancel = context.WithCancel(context.Background())
-
-		// Register the cancel function
-		s.activeDownloadsMutex.Lock()
-		s.activeDownloads[modelUID] = cancel
-		s.activeDownloadsMutex.Unlock()
-
 		// Ensure cleanup on completion
 		defer func() {
-			s.activeDownloadsMutex.Lock()
-			delete(s.activeDownloads, modelUID)
-			s.activeDownloadsMutex.Unlock()
+			s.unregisterActiveDownload(modelUID, activeDownloadGeneration)
 			cancel() // Ensure context is cancelled
 		}()
 	}
@@ -338,6 +393,10 @@ func (s *Gopher) processTask(task *GopherTask) error {
 				return downloadErr
 			})
 			if err != nil {
+				if isDownloadCanceled(ctx, err) {
+					s.logger.Infof("Download canceled for model %s, skipping status update", modelInfo)
+					return nil
+				}
 				s.logger.Errorf("All download attempts failed for model %s: %v", modelInfo, err)
 
 				// Record download failure in metrics
@@ -366,6 +425,10 @@ func (s *Gopher) processTask(task *GopherTask) error {
 				s.logger.Warnf("No model object found in task, skipping config parsing")
 			}
 
+			if !s.isActiveDownloadCurrent(modelUID, activeDownloadGeneration) || ctx.Err() != nil {
+				s.logger.Infof("Download superseded for model %s, skipping config update", modelInfo)
+				return nil
+			}
 			if err := s.safeParseAndUpdateModelConfig(destPath, baseModel, clusterBaseModel, nil); err != nil {
 				s.logger.Errorf("Failed to parse and update model config: %v", err)
 			}
@@ -375,7 +438,11 @@ func (s *Gopher) processTask(task *GopherTask) error {
 			s.logger.Infof("Starting Hugging Face download for model %s", modelInfo)
 
 			// Handle Hugging Face model download
-			if err := s.processHuggingFaceModel(ctx, task, baseModelSpec, modelInfo, modelType, namespace, name); err != nil {
+			if err := s.processHuggingFaceModel(ctx, task, baseModelSpec, modelUID, activeDownloadGeneration, modelInfo, modelType, namespace, name); err != nil {
+				if isDownloadCanceled(ctx, err) {
+					s.logger.Infof("Download canceled for model %s, skipping status update", modelInfo)
+					return nil
+				}
 				// Error is already logged and metrics recorded in the method
 				return err
 			}
@@ -387,11 +454,15 @@ func (s *Gopher) processTask(task *GopherTask) error {
 		case storage.StorageTypeLocal:
 			s.logger.Infof("Processing local storage type for model %s", modelInfo)
 			// For local storage, we just need to validate the path exists and parse model config
-			if err := s.processLocalStorageModel(ctx, task, baseModelSpec, modelInfo, modelType, namespace, name); err != nil {
+			if err := s.processLocalStorageModel(ctx, task, baseModelSpec, modelUID, activeDownloadGeneration, modelInfo, modelType, namespace, name); err != nil {
 				return err
 			}
 		default:
 			return fmt.Errorf("unknown storage type %s", storageType)
+		}
+		if !s.isActiveDownloadCurrent(modelUID, activeDownloadGeneration) || ctx.Err() != nil {
+			s.logger.Infof("Download superseded for model %s, skipping Ready status update", modelInfo)
+			return nil
 		}
 		// Calculate download duration
 		downloadDuration := time.Since(downloadStartTime)
@@ -421,12 +492,7 @@ func (s *Gopher) processTask(task *GopherTask) error {
 		}
 	case Delete:
 		// First, cancel any ongoing download for this model
-		s.activeDownloadsMutex.RLock()
-		if cancelFunc, exists := s.activeDownloads[modelUID]; exists {
-			s.logger.Infof("Cancelling ongoing download for model %s", modelInfo)
-			cancelFunc() // This will cancel the download context
-		}
-		s.activeDownloadsMutex.RUnlock()
+		cancelledGeneration, cancelledDownload := s.cancelActiveDownload(modelUID, modelInfo)
 
 		// Wait a bit for download to stop
 		time.Sleep(2 * time.Second)
@@ -514,9 +580,9 @@ func (s *Gopher) processTask(task *GopherTask) error {
 		}
 
 		// Clean up the active downloads map
-		s.activeDownloadsMutex.Lock()
-		delete(s.activeDownloads, modelUID)
-		s.activeDownloadsMutex.Unlock()
+		if cancelledDownload {
+			s.unregisterActiveDownload(modelUID, cancelledGeneration)
+		}
 	}
 
 	return nil
@@ -958,7 +1024,7 @@ func (s *Gopher) isReservingModelArtifact(task *GopherTask) bool {
 // It extracts model information from the URI, configures the download with proper authentication,
 // performs the download using the hub client, and updates model configuration.
 func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, baseModelSpec v1beta1.BaseModelSpec,
-	modelInfo, modelType, namespace, name string) error {
+	modelUID string, activeDownloadGeneration uint64, modelInfo, modelType, namespace, name string) error {
 	// Parse the Hugging Face URI to get modelID and branch
 	hfComponents, err := storage.ParseHuggingFaceStorageURI(*baseModelSpec.Storage.StorageUri)
 	if err != nil {
@@ -1130,6 +1196,10 @@ func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, 
 		downloadPath, err := xet.SnapshotDownloadWithProgress(ctx, config, progressHandler, progressThrottle)
 
 		if err != nil {
+			if isDownloadCanceled(ctx, err) {
+				s.logger.Infof("HuggingFace download canceled for model %s", modelInfo)
+				return err
+			}
 			// Check error type for better handling
 			if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate limit") {
 				s.logger.Warnf("Rate limited while downloading HuggingFace model %s: %v", modelInfo, err)
@@ -1161,6 +1231,10 @@ func (s *Gopher) processHuggingFaceModel(ctx context.Context, task *GopherTask, 
 		s.logger.Debugf("Using ClusterBaseModel %s for config parsing", clusterBaseModel.Name)
 	}
 
+	if !s.isActiveDownloadCurrent(modelUID, activeDownloadGeneration) || ctx.Err() != nil {
+		s.logger.Infof("HuggingFace download superseded for model %s, skipping config update", modelInfo)
+		return nil
+	}
 	if err := s.safeParseAndUpdateModelConfig(destPath, baseModel, clusterBaseModel, artifact); err != nil {
 		s.logger.Errorf("Failed to parse and update model config: %v", err)
 	}
@@ -1215,7 +1289,7 @@ func (s *Gopher) handelReuseArtifactIfNecessary(ctx context.Context, baseModelSp
 //
 // This allows users to reference pre-existing models without copying or removing them.
 func (s *Gopher) processLocalStorageModel(ctx context.Context, task *GopherTask, baseModelSpec v1beta1.BaseModelSpec,
-	modelInfo, modelType, namespace, name string) error {
+	modelUID string, activeDownloadGeneration uint64, modelInfo, modelType, namespace, name string) error {
 	// Parse the local storage URI to get the path
 	localComponents, err := storage.ParseLocalStorageURI(*baseModelSpec.Storage.StorageUri)
 	if err != nil {
@@ -1260,6 +1334,10 @@ func (s *Gopher) processLocalStorageModel(ctx context.Context, task *GopherTask,
 		s.logger.Debugf("Using ClusterBaseModel %s for config parsing", clusterBaseModel.Name)
 	}
 
+	if !s.isActiveDownloadCurrent(modelUID, activeDownloadGeneration) || ctx.Err() != nil {
+		s.logger.Infof("Local storage processing superseded for model %s, skipping config update", modelInfo)
+		return nil
+	}
 	if err := s.safeParseAndUpdateModelConfig(modelPath, baseModel, clusterBaseModel, nil); err != nil {
 		s.logger.Errorf("Failed to parse and update model config for local model: %v", err)
 		// This is not necessarily a failure - the model might still be usable

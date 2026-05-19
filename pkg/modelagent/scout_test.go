@@ -323,6 +323,113 @@ func TestShouldDownloadModel(t *testing.T) {
 	}
 }
 
+func TestShouldDownloadModelInUpdateEventStorageIdentity(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	sugaredLogger := logger.Sugar()
+	defer func(sugaredLogger *zap.SugaredLogger) {
+		_ = sugaredLogger.Sync()
+	}(sugaredLogger)
+
+	testNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+			Labels: map[string]string{
+				constants.NodeInstanceShapeLabel:           "GPU.A10.2",
+				constants.DeprecatedNodeInstanceShapeLabel: "GPU.A10.2",
+				"gpu-model": "a10",
+			},
+			Annotations: map[string]string{
+				constants.TargetInstanceShapes: "GPU.A10.2",
+			},
+		},
+	}
+
+	scout := &Scout{
+		nodeName:       "test-node",
+		nodeInfo:       testNode,
+		nodeShapeAlias: "a10",
+		logger:         sugaredLogger,
+	}
+
+	testCases := []struct {
+		name     string
+		old      *v1beta1.StorageSpec
+		new      *v1beta1.StorageSpec
+		expected bool
+	}{
+		{
+			name: "storage URI change triggers download",
+			old: &v1beta1.StorageSpec{
+				StorageUri: stringPtr("hf://google/gemma-4-31B-it"),
+				Path:       stringPtr("/raid/models/google/gemma-4-31B-it"),
+			},
+			new: &v1beta1.StorageSpec{
+				StorageUri: stringPtr("hf://google/gemma-4-31b-it"),
+				Path:       stringPtr("/raid/models/google/gemma-4-31b-it"),
+			},
+			expected: true,
+		},
+		{
+			name: "storage path change triggers download",
+			old: &v1beta1.StorageSpec{
+				StorageUri: stringPtr("hf://google/gemma-4-31b-it"),
+				Path:       stringPtr("/raid/models/google/gemma-4-31B-it"),
+			},
+			new: &v1beta1.StorageSpec{
+				StorageUri: stringPtr("hf://google/gemma-4-31b-it"),
+				Path:       stringPtr("/raid/models/google/gemma-4-31b-it"),
+			},
+			expected: true,
+		},
+		{
+			name: "unchanged storage identity does not trigger download",
+			old: &v1beta1.StorageSpec{
+				StorageUri: stringPtr("hf://google/gemma-4-31b-it"),
+				Path:       stringPtr("/raid/models/google/gemma-4-31b-it"),
+			},
+			new: &v1beta1.StorageSpec{
+				StorageUri: stringPtr("hf://google/gemma-4-31b-it"),
+				Path:       stringPtr("/raid/models/google/gemma-4-31b-it"),
+			},
+			expected: false,
+		},
+		{
+			name: "storage identity change does not download on excluded node",
+			old: &v1beta1.StorageSpec{
+				StorageUri: stringPtr("hf://google/gemma-4-31B-it"),
+				Path:       stringPtr("/raid/models/google/gemma-4-31B-it"),
+			},
+			new: &v1beta1.StorageSpec{
+				StorageUri: stringPtr("hf://google/gemma-4-31b-it"),
+				Path:       stringPtr("/raid/models/google/gemma-4-31b-it"),
+				NodeSelector: map[string]string{
+					"gpu-model": "a100",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "PVC storage identity change does not trigger model-agent download",
+			old: &v1beta1.StorageSpec{
+				StorageUri: stringPtr("hf://google/gemma-4-31b-it"),
+			},
+			new: &v1beta1.StorageSpec{
+				StorageUri: stringPtr("pvc://model-namespace:model-pvc/gemma"),
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := scout.shouldDownloadModelInUpdateEvent(tc.old, tc.new)
+			if result != tc.expected {
+				t.Errorf("expected %v, got %v", tc.expected, result)
+			}
+		})
+	}
+}
+
 // Helper function to return a string pointer
 func stringPtr(s string) *string {
 	return &s

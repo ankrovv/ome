@@ -171,6 +171,87 @@ func TestHandleTaskPVCSkip(t *testing.T) {
 	}
 }
 
+func TestRegisterActiveDownloadCancelsPreviousAndPreservesNewer(t *testing.T) {
+	gopher := &Gopher{
+		activeDownloads: make(map[string]activeDownload),
+		logger:          zaptest.NewLogger(t).Sugar(),
+	}
+	modelUID := "model-uid"
+	modelInfo := "BaseModel default/test-model"
+
+	firstCtx, firstCancel := context.WithCancel(context.Background())
+	firstGeneration := gopher.registerActiveDownload(modelUID, modelInfo, firstCancel)
+	assert.NoError(t, firstCtx.Err())
+
+	secondCtx, secondCancel := context.WithCancel(context.Background())
+	defer secondCancel()
+	secondGeneration := gopher.registerActiveDownload(modelUID, modelInfo, secondCancel)
+
+	assert.NotEqual(t, firstGeneration, secondGeneration)
+	assert.ErrorIs(t, firstCtx.Err(), context.Canceled)
+	assert.NoError(t, secondCtx.Err())
+
+	gopher.unregisterActiveDownload(modelUID, firstGeneration)
+	active, exists := gopher.activeDownloads[modelUID]
+	assert.True(t, exists)
+	assert.Equal(t, secondGeneration, active.generation)
+	assert.False(t, gopher.isActiveDownloadCurrent(modelUID, firstGeneration))
+	assert.True(t, gopher.isActiveDownloadCurrent(modelUID, secondGeneration))
+
+	gopher.unregisterActiveDownload(modelUID, secondGeneration)
+	_, exists = gopher.activeDownloads[modelUID]
+	assert.False(t, exists)
+}
+
+func TestCancelActiveDownload(t *testing.T) {
+	gopher := &Gopher{
+		activeDownloads: make(map[string]activeDownload),
+		logger:          zaptest.NewLogger(t).Sugar(),
+	}
+	modelUID := "model-uid"
+	modelInfo := "BaseModel default/test-model"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	generation := gopher.registerActiveDownload(modelUID, modelInfo, cancel)
+
+	cancelledGeneration, cancelled := gopher.cancelActiveDownload(modelUID, modelInfo)
+	assert.True(t, cancelled)
+	assert.Equal(t, generation, cancelledGeneration)
+	assert.ErrorIs(t, ctx.Err(), context.Canceled)
+
+	gopher.unregisterActiveDownload(modelUID, generation)
+	_, exists := gopher.activeDownloads[modelUID]
+	assert.False(t, exists)
+	_, cancelled = gopher.cancelActiveDownload(modelUID, modelInfo)
+	assert.False(t, cancelled)
+}
+
+func TestCancelActiveDownloadDoesNotRemoveNewerGeneration(t *testing.T) {
+	gopher := &Gopher{
+		activeDownloads: make(map[string]activeDownload),
+		logger:          zaptest.NewLogger(t).Sugar(),
+	}
+	modelUID := "model-uid"
+	modelInfo := "BaseModel default/test-model"
+
+	firstCtx, firstCancel := context.WithCancel(context.Background())
+	firstGeneration := gopher.registerActiveDownload(modelUID, modelInfo, firstCancel)
+	cancelledGeneration, cancelled := gopher.cancelActiveDownload(modelUID, modelInfo)
+	assert.True(t, cancelled)
+	assert.Equal(t, firstGeneration, cancelledGeneration)
+	assert.ErrorIs(t, firstCtx.Err(), context.Canceled)
+
+	secondCtx, secondCancel := context.WithCancel(context.Background())
+	defer secondCancel()
+	secondGeneration := gopher.registerActiveDownload(modelUID, modelInfo, secondCancel)
+
+	gopher.unregisterActiveDownload(modelUID, cancelledGeneration)
+	active, exists := gopher.activeDownloads[modelUID]
+	assert.True(t, exists)
+	assert.Equal(t, secondGeneration, active.generation)
+	assert.NoError(t, secondCtx.Err())
+}
+
 // TestShouldDownloadModelPVC tests that PVC models are skipped in scout
 func TestShouldDownloadModelPVC(t *testing.T) {
 	// Create a test logger
